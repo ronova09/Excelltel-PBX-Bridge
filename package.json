@@ -1,0 +1,26 @@
+{
+  "name": "PBX-Bridge",
+  "version": "1.0.0",
+  "description": "Excelltel PBX Bridge",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.24.2",
+    "ws": "^8.21.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "nodemon": "^3.1.14",
+    "postject": "^1.0.0-alpha.6"
+  }
+}
