@@ -28524,13 +28524,13 @@ var require_server = __commonJS({
       port: PORT,
       // Only Apache on this computer
       // should access port 3001 directly.
-      host: "127.0.0.1"
+      host: "0.0.0.0"
     });
     wss.on(
       "listening",
       () => {
         console.log(
-          `Secure WebSocket server listening on ws://127.0.0.1:${PORT}`
+          `Secure WebSocket server listening on ws://0.0.0.0:${PORT}`
         );
       }
     );
