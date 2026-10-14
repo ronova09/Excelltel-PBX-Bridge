@@ -274,7 +274,7 @@ async function cleanupOldCallNotifications() {
             WHERE CREATED_AT <
                 DATE_SUB(
                     NOW(),
-                    INTERVAL 12 MONTH
+                    INTERVAL 1 MONTH
                 )
             `
         );
