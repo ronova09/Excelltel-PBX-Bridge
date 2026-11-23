@@ -1,5 +1,7 @@
 
-const FRONT_DESK_ID = 0;
+const FRONT_DESK_ID =
+    Number(process.env.PBX_OPERATOR_PORT || 1) - 1;
+    
 const dgram = require('dgram');
 const { spawn } = require('child_process');
 
@@ -7,7 +9,7 @@ const { spawn } = require('child_process');
 // PBX CONNECTION CONFIGURATION
 // =====================================
 
-const PBX_IP = '192.168.110.114';
+const PBX_IP = '192.168.123.249';
 const PBX_PORT = 50001;
 
 const PBX_PING_INTERVAL_MS = 1000;
@@ -28,13 +30,195 @@ const {
     buildExtensionTableRequest
 } = require('../protocol/extensionPoll');
 const {
-    decodeExtensionTable
+    decodeExtensionTable,
+    createExtensionTableAssembler
 } = require('../protocol/extensionTable');
 const {
     broadcast
 } = require('../websocket/server');
 const callTracker = new CallTracker();
 const socket = dgram.createSocket('udp4');
+
+// =====================================
+// PBX EXTENSION TABLE ASSEMBLER
+// =====================================
+
+const PBX_FRAGMENTED_TABLE =
+    process.env.PBX_FRAGMENTED_TABLE === 'true';
+
+const PBX_EXTENSION_PORTS = 124;
+
+const EXTENSION_BLOCKS = [
+    [0x03, 0x00],
+    [0x03, 0x80],
+    [0x04, 0x00],
+    [0x04, 0x80]
+];
+
+let extensionAssembler = null;
+let extensionBlockIndex = 0;
+let extensionResults = {};
+let extensionSyncTimer = null;
+let extensionSyncReady = false;
+
+const EXTENSION_POLL_TIMEOUT_MS = 3000;
+
+// =====================================
+// AUTOMATIC EXTENSION TABLE POLLING
+// =====================================
+
+function cancelExtensionSync() {
+
+    clearTimeout(extensionSyncTimer);
+
+    extensionSyncTimer = null;
+    extensionAssembler = null;
+    extensionSyncReady = false;
+
+}
+
+function startExtensionSync() {
+
+    cancelExtensionSync();
+
+    extensionBlockIndex = 0;
+    extensionResults = {};
+
+    console.log('===================================');
+    console.log('PBX EXTENSION SYNCHRONIZATION');
+    console.log('===================================');
+
+    extensionSyncTimer = setTimeout(
+        requestNextExtensionBlock,
+        500
+    );
+
+}
+
+function requestNextExtensionBlock() {
+
+    // All extension blocks have been received.
+    if (extensionBlockIndex >= EXTENSION_BLOCKS.length) {
+
+        const extensions = {};
+
+        for (const [id, extension] of Object.entries(
+            extensionResults
+        )) {
+
+            if (Number(id) < PBX_EXTENSION_PORTS) {
+
+                extensions[id] = extension;
+
+            }
+
+        }
+
+        // Update the registry only after all blocks
+        // have been successfully retrieved.
+
+        setExtensions(extensions);
+
+        extensionAssembler = null;
+        extensionSyncReady = true;
+
+        console.log('===================================');
+        console.log('EXTENSION SYNCHRONIZATION COMPLETE');
+        console.log('===================================');
+
+        // =====================================
+// EXTENSION SYNCHRONIZATION STATUS
+// =====================================
+
+console.log(
+    `PBX Extensions Synchronized: ${
+        Object.keys(extensions).length
+    } telephone extensions loaded.`
+);
+
+        return;
+
+    }
+
+    const [index, offset] =
+        EXTENSION_BLOCKS[extensionBlockIndex];
+
+    extensionAssembler =
+        createExtensionTableAssembler(
+            EXTENSION_POLL_TIMEOUT_MS,
+            index,
+            offset
+        );
+
+    const currentAssembler = extensionAssembler;
+
+    const request =
+        buildExtensionTableRequest(index, offset);
+
+    console.log(
+        `Requesting extension block ${
+            extensionBlockIndex + 1
+        }/${EXTENSION_BLOCKS.length}`
+    );
+
+    console.log(
+        'Request HEX:',
+        request.toString('hex').match(/../g).join(' ')
+    );
+
+    extensionSyncTimer = setTimeout(() => {
+
+        console.error(
+            `Extension block ${
+                extensionBlockIndex + 1
+            } timed out.`
+        );
+
+        cancelExtensionSync();
+
+    }, EXTENSION_POLL_TIMEOUT_MS);
+
+    socket.send(
+        request,
+        PBX_PORT,
+        PBX_IP,
+        (err) => {
+
+            if (
+                err &&
+                extensionAssembler === currentAssembler
+            ) {
+
+                console.error(
+                    'Extension request failed:',
+                    err.message
+                );
+
+                cancelExtensionSync();
+
+            }
+
+        }
+    );
+
+}
+
+    // =====================================
+// PBX REGISTRATION BUFFER
+// =====================================
+
+let registrationBuffer = Buffer.alloc(0);
+let registrationStartedAt = 0;
+
+const REGISTRATION_LENGTH = 13;
+const REGISTRATION_TIMEOUT_MS = 2000;
+
+function resetRegistrationBuffer() {
+
+    registrationBuffer = Buffer.alloc(0);
+    registrationStartedAt = 0;
+
+}
 
 function formatDate(date) {
     if (!date) return null;
@@ -80,21 +264,156 @@ socket.on('message', async (msg, rinfo) => {
     console.log(`Length : ${msg.length} bytes`);
 
     // Raw HEX debugging
-    // console.log(
-    //     `HEX    : ${msg.toString('hex').match(/../g).join(' ')}`
-    // );
-
+    console.log(
+         `HEX    : ${msg.toString('hex').match(/../g)?.join(' ') || '(empty)'}`
+    );
 
     // =========================================
-    // PBXI REGISTRATION RESPONSE
-    // =========================================
+// FRAGMENTED REGISTRATION RESPONSE
+// =========================================
 
+if (
+    PBX_FRAGMENTED_TABLE &&
+    rinfo.address === PBX_IP &&
+    rinfo.port === PBX_PORT
+) {
+
+    const now = Date.now();
+
+    // Discard expired registration fragments.
     if (
-        msg.length === 13 &&
-        msg[0] === 0x0D &&
-        msg[1] === 0x05
+        registrationBuffer.length &&
+        now - registrationStartedAt >= REGISTRATION_TIMEOUT_MS
     ) {
-        console.log('PBX registration confirmed.');
+
+        resetRegistrationBuffer();
+
+    }
+
+    const isRegistrationHeader =
+        msg.length >= 2 &&
+        msg[0] === 0x0D &&
+        msg[1] === 0x05;
+
+    if (isRegistrationHeader) {
+
+        resetRegistrationBuffer();
+
+        // Registration response is incomplete.
+        if (msg.length < REGISTRATION_LENGTH) {
+
+            registrationBuffer = Buffer.from(msg);
+            registrationStartedAt = now;
+
+            console.log(
+                `Registration fragment received: ${msg.length} bytes`
+            );
+
+            console.log(
+                'Waiting for remaining registration fragments...'
+            );
+
+            return;
+
+        }
+
+    } else if (registrationBuffer.length) {
+
+        const remaining =
+            REGISTRATION_LENGTH - registrationBuffer.length;
+
+        // Protect known call events.
+        const isCallEvent = (
+
+            (
+                msg.length === 4 &&
+                msg[0] === 0x04 &&
+                (
+                    msg[1] === 0x10 ||
+                    msg[1] === 0x11
+                )
+            ) ||
+
+            (
+                msg.length === 5 &&
+                msg[0] === 0x05 &&
+                msg[1] === 0x32
+            )
+
+        ) && (
+            msg.subarray(0, -1)
+                .reduce((xor, byte) => xor ^ byte, 0)
+            === msg[msg.length - 1]
+        );
+
+        if (!isCallEvent && msg.length <= remaining) {
+
+            console.log(
+                `Registration fragment received: ${msg.length} bytes`
+            );
+
+            registrationBuffer = Buffer.concat([
+                registrationBuffer,
+                msg
+            ]);
+
+            if (registrationBuffer.length < REGISTRATION_LENGTH) {
+
+                return;
+
+            }
+
+            const assembled = registrationBuffer;
+
+            resetRegistrationBuffer();
+
+            const checksum = assembled
+                .subarray(0, -1)
+                .reduce((xor, byte) => xor ^ byte, 0);
+
+            if (checksum === assembled[assembled.length - 1]) {
+
+                msg = assembled;
+
+                console.log(
+                    'Registration response assembled successfully.'
+                );
+
+            } else {
+
+                console.warn(
+                    'Registration response rejected: Invalid checksum.'
+                );
+
+                return;
+
+            }
+
+        }
+
+    }
+
+}
+
+    // =========================================
+// PBXI REGISTRATION RESPONSE
+// =========================================
+
+if (
+    msg.length === 13 &&
+    msg[0] === 0x0D &&
+    msg[1] === 0x05
+) {
+
+    console.log('PBX registration confirmed.');
+
+    if (PBX_FRAGMENTED_TABLE) {
+
+        startExtensionSync();
+
+    } else {
+
+        // Original CP832 polling behavior.
 
         setTimeout(() => {
 
@@ -106,29 +425,176 @@ socket.on('message', async (msg, rinfo) => {
 
             socket.send(
                 request,
-                50001,
-                '192.168.110.114'
+                PBX_PORT,
+                PBX_IP
             );
 
             console.log(
                 'Extension table request sent:',
-                request
-                    .toString('hex')
+                request.toString('hex')
                     .match(/../g)
                     .join(' ')
             );
 
         }, 500);
 
+    }
+
+    return;
+
+}
+
+// =========================================
+// FRAGMENTED EXTENSION TABLE RESPONSE
+// =========================================
+
+// =========================================
+// MULTI-BLOCK EXTENSION TABLE RESPONSE
+// =========================================
+
+if (PBX_FRAGMENTED_TABLE) {
+
+    // Only accept packets from our configured PBX.
+
+    if (
+        rinfo.address !== PBX_IP ||
+        rinfo.port !== PBX_PORT
+    ) {
         return;
     }
 
+    if (!extensionSyncReady) {
+
+        if (!extensionAssembler) {
+            return;
+        }
+
+        const [index, offset] =
+            EXTENSION_BLOCKS[extensionBlockIndex];
+
+        const expectedHeader = Buffer.from([
+            0x87,
+            0x04,
+            0x01,
+            index,
+            offset,
+            0x80
+        ]);
+
+        const isTableHeader =
+            msg.subarray(0, 6).equals(expectedHeader);
+
+        const isOtherTableHeader =
+            msg.length >= 6 &&
+            msg[0] === 0x87 &&
+            msg[1] === 0x04 &&
+            msg[2] === 0x01 &&
+            !isTableHeader;
+
+        // Protect the assembler from unrelated
+        // hook and dial events.
+
+        const isCallEvent = (
+
+            (
+                msg.length === 4 &&
+                msg[0] === 0x04 &&
+                (
+                    msg[1] === 0x10 ||
+                    msg[1] === 0x11
+                )
+            ) ||
+
+            (
+                msg.length === 5 &&
+                msg[0] === 0x05 &&
+                msg[1] === 0x32
+            )
+
+        ) && (
+            msg.subarray(0, -1)
+                .reduce((xor, byte) => xor ^ byte, 0)
+            === msg[msg.length - 1]
+        );
+
+        if (
+            isOtherTableHeader ||
+            isCallEvent
+        ) {
+            return;
+        }
+
+        if (
+            isTableHeader ||
+            extensionAssembler.isPending()
+        ) {
+
+            console.log(
+                `Block ${extensionBlockIndex + 1} fragment: ${
+                    msg.length
+                } bytes`
+            );
+
+            const extensions =
+                extensionAssembler.push(msg);
+
+            if (extensions !== null) {
+
+                clearTimeout(extensionSyncTimer);
+                extensionSyncTimer = null;
+
+                Object.assign(
+                    extensionResults,
+                    extensions
+                );
+
+                console.log(
+                    `Block ${
+                        extensionBlockIndex + 1
+                    }/${EXTENSION_BLOCKS.length} completed.`
+                );
+
+                console.log(
+                    `Records retrieved: ${
+                        Object.keys(extensionResults).length
+                    }`
+                );
+
+                extensionBlockIndex++;
+
+                requestNextExtensionBlock();
+
+            } else if (extensionAssembler.isPending()) {
+
+                console.log(
+                    'Waiting for remaining fragments...'
+                );
+
+            } else {
+
+                console.warn(
+                    'Extension response rejected: Invalid length or checksum.'
+                );
+
+            }
+
+        }
+
+        // Do not process calls until the directory
+        // has been completely synchronized.
+
+        return;
+
+    }
+
+}
 
     // =========================================
     // EXTENSION TABLE RESPONSE
     // =========================================
 
     if (
+        !PBX_FRAGMENTED_TABLE &&
         msg.length >= 134 &&
         msg[0] === 0x87 &&
         msg[1] === 0x04 &&
@@ -341,7 +807,7 @@ if (
 
 }
 
-    // =====================================
+// =====================================
 // SAVE OUTGOING OPERATOR CALL
 // =====================================
 
