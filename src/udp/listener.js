@@ -1,6 +1,43 @@
 
-const FRONT_DESK_ID =
-    Number(process.env.PBX_OPERATOR_PORT || 1) - 1;
+// =====================================
+// PBX MULTIPLE OPERATOR SUPPORT
+// MAXIMUM 4 OPERATORS
+// =====================================
+
+const OPERATOR_PORTS = String(
+    process.env.PBX_OPERATOR_PORTS ||
+    process.env.PBX_OPERATOR_PORT ||
+    '121'
+)
+.split(',')
+.map(port => Number(port.trim()));
+
+// Validate operator configuration
+if (
+    OPERATOR_PORTS.length === 0 ||
+    OPERATOR_PORTS.length > 4 ||
+    OPERATOR_PORTS.some(
+        port =>
+            !Number.isInteger(port) ||
+            port < 121 ||
+            port > 124
+    ) ||
+    new Set(OPERATOR_PORTS).size !== OPERATOR_PORTS.length
+) {
+    throw new Error(
+        'Invalid PBX operator configuration. Maximum 4 operator ports (121-124).'
+    );
+}
+
+// Convert physical ports to PBX internal IDs
+const FRONT_DESK_IDS = new Set(
+    OPERATOR_PORTS.map(port => port - 1)
+);
+
+console.log(
+    'PBX Operator IDs:',
+    [...FRONT_DESK_IDS]
+);
     
 const dgram = require('dgram');
 const { spawn } = require('child_process');
@@ -693,10 +730,14 @@ if (PBX_FRAGMENTED_TABLE) {
     // =====================================
 
     const isIncomingToOperator =
-        callState.destinationId === FRONT_DESK_ID;
+    FRONT_DESK_IDS.has(
+        Number(callState.destinationId)
+    );
 
     const isOutgoingFromOperator =
-        callState.callerId === FRONT_DESK_ID;
+    FRONT_DESK_IDS.has(
+        Number(callState.callerId)
+    );
 
         console.log('PBX CALL DEBUG:', {
     state: callState.state,

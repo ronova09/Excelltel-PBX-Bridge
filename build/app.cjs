@@ -49091,6 +49091,148 @@ var require_server2 = __commonJS({
   }
 });
 
+// src/udp/pbxRadar.js
+var require_pbxRadar = __commonJS({
+  "src/udp/pbxRadar.js"(exports2, module2) {
+    "use strict";
+    var REGISTRATION_PACKET = Buffer.from("060550425849", "hex");
+    var RESPONSE_BYTES = 13;
+    function validRegistration(packet) {
+      if (packet.length !== RESPONSE_BYTES || packet[0] !== 13 || packet[1] !== 5) {
+        return false;
+      }
+      const checksum = packet.subarray(0, -1).reduce(
+        (value, byte) => value ^ byte,
+        0
+      );
+      return checksum === packet[packet.length - 1];
+    }
+    function createPbxRadar(socket, options = {}) {
+      const prefix = options.prefix ?? "192.168.110";
+      const port = options.port ?? 50001;
+      const batchSize = options.batchSize ?? 4;
+      const tickMs = options.tickMs ?? 200;
+      const graceMs = options.graceMs ?? 3e3;
+      if (!/^(?:\d{1,3}\.){2}\d{1,3}$/.test(prefix) || prefix.split(".").some(
+        (part) => Number(part) > 255
+      ) || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(batchSize) || batchSize < 1 || !Number.isInteger(tickMs) || tickMs < 1 || !Number.isInteger(graceMs) || graceMs < 1) {
+        throw new Error(
+          "Invalid PBX Radar configuration."
+        );
+      }
+      let inProgress = null;
+      function discover() {
+        if (inProgress) {
+          return inProgress;
+        }
+        inProgress = new Promise((resolve) => {
+          let nextHost = 1;
+          let finished = false;
+          let sweepTimer;
+          let graceTimer;
+          const fragments = /* @__PURE__ */ new Map();
+          function finish(address = null) {
+            if (finished) return;
+            finished = true;
+            clearInterval(sweepTimer);
+            clearTimeout(graceTimer);
+            socket.off("message", onMessage);
+            resolve(address);
+          }
+          function onMessage(packet, remote) {
+            if (finished || remote.port !== port || !remote.address.startsWith(
+              `${prefix}.`
+            )) {
+              return;
+            }
+            if (packet.length >= 2 && packet[0] === 13 && packet[1] === 5) {
+              if (validRegistration(packet)) {
+                finish(remote.address);
+                return;
+              }
+              if (packet.length < RESPONSE_BYTES) {
+                fragments.set(remote.address, {
+                  bytes: Buffer.from(packet),
+                  at: Date.now()
+                });
+              }
+              return;
+            }
+            const pending = fragments.get(remote.address);
+            if (!pending) return;
+            if (Date.now() - pending.at > 2e3 || packet.length > RESPONSE_BYTES - pending.bytes.length) {
+              fragments.delete(remote.address);
+              return;
+            }
+            if (packet[0] === 4 && (packet[1] === 16 || packet[1] === 17) || packet[0] === 5 && packet[1] === 50) {
+              return;
+            }
+            const complete = Buffer.concat([
+              pending.bytes,
+              packet
+            ]);
+            fragments.delete(remote.address);
+            if (validRegistration(complete)) {
+              finish(remote.address);
+            } else if (complete.length < RESPONSE_BYTES) {
+              fragments.set(remote.address, {
+                bytes: complete,
+                at: pending.at
+              });
+            }
+          }
+          function sendBatch() {
+            for (let count = 0; count < batchSize && nextHost <= 254 && !finished; count++) {
+              const address = `${prefix}.${nextHost++}`;
+              socket.send(
+                REGISTRATION_PACKET,
+                port,
+                address,
+                (error) => {
+                  if (error && !finished) {
+                    console.warn(
+                      `[RADAR] Probe to ${address}: ${error.message}`
+                    );
+                  }
+                }
+              );
+            }
+            if (nextHost > 254 && !finished) {
+              clearInterval(sweepTimer);
+              graceTimer = setTimeout(
+                () => finish(null),
+                graceMs
+              );
+            }
+          }
+          console.log("");
+          console.log("===================================");
+          console.log("PBX RADAR INITIALIZED");
+          console.log(`Network: ${prefix}.0/24`);
+          console.log(`UDP Port: ${port}`);
+          console.log("===================================");
+          socket.on("message", onMessage);
+          sweepTimer = setInterval(
+            sendBatch,
+            tickMs
+          );
+          sendBatch();
+        }).finally(() => {
+          inProgress = null;
+        });
+        return inProgress;
+      }
+      return {
+        discover
+      };
+    }
+    module2.exports = {
+      createPbxRadar,
+      validRegistration
+    };
+  }
+});
+
 // src/protocol/extensionRegistry.js
 var require_extensionRegistry = __commonJS({
   "src/protocol/extensionRegistry.js"(exports2, module2) {
@@ -49291,10 +49433,10 @@ var require_extensionTable = __commonJS({
       }
       return extension || null;
     }
-    function decodeExtensionTable(buffer) {
+    function decodeExtensionTable(buffer, startId = 0) {
       const extensions = {};
       for (let offset = 0; offset + 3 < buffer.length; offset += 4) {
-        const extensionId = offset / 4;
+        const extensionId = startId + offset / 4;
         const byte1 = buffer[offset];
         const byte2 = buffer[offset + 1];
         if (byte1 === 221 && byte2 === 221) {
@@ -49307,9 +49449,67 @@ var require_extensionTable = __commonJS({
       }
       return extensions;
     }
+    function createExtensionTableAssembler(timeoutMs = 2e3, index = 3, offset = 0) {
+      const address = index << 8 | offset;
+      const startId = (address - 768) / 4;
+      const header = Buffer.from([
+        135,
+        4,
+        1,
+        index,
+        offset,
+        128
+      ]);
+      let pending = Buffer.alloc(0);
+      let startedAt = 0;
+      function reset() {
+        pending = Buffer.alloc(0);
+        startedAt = 0;
+      }
+      function push(chunk) {
+        const now = Date.now();
+        if (pending.length && now - startedAt >= timeoutMs) {
+          reset();
+        }
+        if (chunk.subarray(0, header.length).equals(header)) {
+          reset();
+          startedAt = now;
+        } else if (!pending.length) {
+          return null;
+        }
+        pending = Buffer.concat([pending, chunk]);
+        const expectedLength = header[0];
+        if (pending.length < expectedLength) {
+          return null;
+        }
+        const frame = pending;
+        reset();
+        if (frame.length !== expectedLength) {
+          return null;
+        }
+        const checksum = frame.subarray(0, -1).reduce((xor, byte) => xor ^ byte, 0);
+        if (checksum !== frame[frame.length - 1]) {
+          return null;
+        }
+        const payload = frame.subarray(header.length, -1);
+        return decodeExtensionTable(payload, startId);
+      }
+      function isPending() {
+        if (pending.length && Date.now() - startedAt >= timeoutMs) {
+          reset();
+        }
+        return pending.length > 0;
+      }
+      return {
+        push,
+        reset,
+        isPending
+      };
+    }
     module2.exports = {
       decodeExtensionNumber,
-      decodeExtensionTable
+      decodeExtensionTable,
+      createExtensionTableAssembler
     };
   }
 });
@@ -49317,11 +49517,16 @@ var require_extensionTable = __commonJS({
 // src/udp/listener.js
 var require_listener = __commonJS({
   "src/udp/listener.js"(exports2, module2) {
-    var FRONT_DESK_ID = 0;
+    var FRONT_DESK_ID = Number(process.env.PBX_OPERATOR_PORT || 1) - 1;
     var dgram = require("dgram");
     var { spawn } = require("child_process");
-    var PBX_IP = "192.168.110.114";
+    var {
+      createPbxRadar,
+      validRegistration
+    } = require_pbxRadar();
+    var PBX_IP = null;
     var PBX_PORT = 50001;
+    var PBX_RADAR_PREFIX = process.env.PBX_RADAR_PREFIX || "192.168.110";
     var PBX_PING_INTERVAL_MS = 1e3;
     var PBX_TIMEOUT_MS = 2e3;
     var { decodePacket } = require_decoder();
@@ -49339,13 +49544,117 @@ var require_listener = __commonJS({
       buildExtensionTableRequest
     } = require_extensionPoll();
     var {
-      decodeExtensionTable
+      decodeExtensionTable,
+      createExtensionTableAssembler
     } = require_extensionTable();
     var {
       broadcast
     } = require_server();
     var callTracker = new CallTracker();
     var socket = dgram.createSocket("udp4");
+    var radar = createPbxRadar(socket, {
+      prefix: PBX_RADAR_PREFIX,
+      port: PBX_PORT
+    });
+    var radarSearching = false;
+    var radarRetryTimer = null;
+    var PBX_FRAGMENTED_TABLE = process.env.PBX_FRAGMENTED_TABLE === "true";
+    var PBX_EXTENSION_PORTS = 124;
+    var EXTENSION_BLOCKS = [
+      [3, 0],
+      [3, 128],
+      [4, 0],
+      [4, 128]
+    ];
+    var extensionAssembler = null;
+    var extensionBlockIndex = 0;
+    var extensionResults = {};
+    var extensionSyncTimer = null;
+    var extensionSyncReady = false;
+    var EXTENSION_POLL_TIMEOUT_MS = 3e3;
+    function cancelExtensionSync() {
+      clearTimeout(extensionSyncTimer);
+      extensionSyncTimer = null;
+      extensionAssembler = null;
+      extensionSyncReady = false;
+    }
+    function startExtensionSync() {
+      cancelExtensionSync();
+      extensionBlockIndex = 0;
+      extensionResults = {};
+      console.log("===================================");
+      console.log("PBX EXTENSION SYNCHRONIZATION");
+      console.log("===================================");
+      extensionSyncTimer = setTimeout(
+        requestNextExtensionBlock,
+        500
+      );
+    }
+    function requestNextExtensionBlock() {
+      if (extensionBlockIndex >= EXTENSION_BLOCKS.length) {
+        const extensions = {};
+        for (const [id, extension] of Object.entries(
+          extensionResults
+        )) {
+          if (Number(id) < PBX_EXTENSION_PORTS) {
+            extensions[id] = extension;
+          }
+        }
+        setExtensions(extensions);
+        extensionAssembler = null;
+        extensionSyncReady = true;
+        console.log("===================================");
+        console.log("EXTENSION SYNCHRONIZATION COMPLETE");
+        console.log("===================================");
+        console.log(
+          `PBX Extensions Synchronized: ${Object.keys(extensions).length} telephone extensions loaded.`
+        );
+        return;
+      }
+      const [index, offset] = EXTENSION_BLOCKS[extensionBlockIndex];
+      extensionAssembler = createExtensionTableAssembler(
+        EXTENSION_POLL_TIMEOUT_MS,
+        index,
+        offset
+      );
+      const currentAssembler = extensionAssembler;
+      const request = buildExtensionTableRequest(index, offset);
+      console.log(
+        `Requesting extension block ${extensionBlockIndex + 1}/${EXTENSION_BLOCKS.length}`
+      );
+      console.log(
+        "Request HEX:",
+        request.toString("hex").match(/../g).join(" ")
+      );
+      extensionSyncTimer = setTimeout(() => {
+        console.error(
+          `Extension block ${extensionBlockIndex + 1} timed out.`
+        );
+        cancelExtensionSync();
+      }, EXTENSION_POLL_TIMEOUT_MS);
+      socket.send(
+        request,
+        PBX_PORT,
+        PBX_IP,
+        (err) => {
+          if (err && extensionAssembler === currentAssembler) {
+            console.error(
+              "Extension request failed:",
+              err.message
+            );
+            cancelExtensionSync();
+          }
+        }
+      );
+    }
+    var registrationBuffer = Buffer.alloc(0);
+    var registrationStartedAt = 0;
+    var REGISTRATION_LENGTH = 13;
+    var REGISTRATION_TIMEOUT_MS = 2e3;
+    function resetRegistrationBuffer() {
+      registrationBuffer = Buffer.alloc(0);
+      registrationStartedAt = 0;
+    }
     function formatDate(date) {
       if (!date) return null;
       return date.toLocaleString("en-PH", {
@@ -49364,41 +49673,158 @@ var require_listener = __commonJS({
       console.log("===================================");
       console.log("PBX UDP Client Started");
       console.log("===================================");
-      console.log(`Listening on ${addr.address}:${addr.port}`);
-      setTimeout(() => {
-        sendPacket(
-          "06 05 50 42 58 49",
-          PBX_IP,
-          PBX_PORT
-        );
-      }, 2e3);
+      console.log(
+        `Listening on ${addr.address}:${addr.port}`
+      );
       console.log("");
+      console.log("Initializing PBX Radar...");
+      console.log("");
+      setTimeout(
+        discoverAndConnect,
+        2e3
+      );
     });
     socket.on("message", async (msg, rinfo) => {
+      if (radarSearching || !PBX_IP || rinfo.address !== PBX_IP || rinfo.port !== PBX_PORT) {
+        return;
+      }
       console.log("-----------------------------------");
       console.log(`Time   : ${(/* @__PURE__ */ new Date()).toLocaleTimeString()}`);
       console.log(`From   : ${rinfo.address}:${rinfo.port}`);
       console.log(`Length : ${msg.length} bytes`);
-      if (msg.length === 13 && msg[0] === 13 && msg[1] === 5) {
+      console.log(
+        `HEX    : ${msg.toString("hex").match(/../g)?.join(" ") || "(empty)"}`
+      );
+      if (PBX_FRAGMENTED_TABLE && rinfo.address === PBX_IP && rinfo.port === PBX_PORT) {
+        const now = Date.now();
+        if (registrationBuffer.length && now - registrationStartedAt >= REGISTRATION_TIMEOUT_MS) {
+          resetRegistrationBuffer();
+        }
+        const isRegistrationHeader = msg.length >= 2 && msg[0] === 13 && msg[1] === 5;
+        if (isRegistrationHeader) {
+          resetRegistrationBuffer();
+          if (msg.length < REGISTRATION_LENGTH) {
+            registrationBuffer = Buffer.from(msg);
+            registrationStartedAt = now;
+            console.log(
+              `Registration fragment received: ${msg.length} bytes`
+            );
+            console.log(
+              "Waiting for remaining registration fragments..."
+            );
+            return;
+          }
+        } else if (registrationBuffer.length) {
+          const remaining = REGISTRATION_LENGTH - registrationBuffer.length;
+          const isCallEvent = (msg.length === 4 && msg[0] === 4 && (msg[1] === 16 || msg[1] === 17) || msg.length === 5 && msg[0] === 5 && msg[1] === 50) && msg.subarray(0, -1).reduce((xor, byte) => xor ^ byte, 0) === msg[msg.length - 1];
+          if (!isCallEvent && msg.length <= remaining) {
+            console.log(
+              `Registration fragment received: ${msg.length} bytes`
+            );
+            registrationBuffer = Buffer.concat([
+              registrationBuffer,
+              msg
+            ]);
+            if (registrationBuffer.length < REGISTRATION_LENGTH) {
+              return;
+            }
+            const assembled = registrationBuffer;
+            resetRegistrationBuffer();
+            const checksum = assembled.subarray(0, -1).reduce((xor, byte) => xor ^ byte, 0);
+            if (checksum === assembled[assembled.length - 1]) {
+              msg = assembled;
+              console.log(
+                "Registration response assembled successfully."
+              );
+            } else {
+              console.warn(
+                "Registration response rejected: Invalid checksum."
+              );
+              return;
+            }
+          }
+        }
+      }
+      if (validRegistration(msg)) {
         console.log("PBX registration confirmed.");
-        setTimeout(() => {
-          const request = buildExtensionTableRequest(
-            3,
-            0
-          );
-          socket.send(
-            request,
-            50001,
-            "192.168.110.114"
-          );
-          console.log(
-            "Extension table request sent:",
-            request.toString("hex").match(/../g).join(" ")
-          );
-        }, 500);
+        if (PBX_FRAGMENTED_TABLE) {
+          startExtensionSync();
+        } else {
+          setTimeout(() => {
+            const request = buildExtensionTableRequest(
+              3,
+              0
+            );
+            socket.send(
+              request,
+              PBX_PORT,
+              PBX_IP
+            );
+            console.log(
+              "Extension table request sent:",
+              request.toString("hex").match(/../g).join(" ")
+            );
+          }, 500);
+        }
         return;
       }
-      if (msg.length >= 134 && msg[0] === 135 && msg[1] === 4 && msg[2] === 1 && msg[3] === 3 && msg[4] === 0 && msg[5] === 128) {
+      if (PBX_FRAGMENTED_TABLE) {
+        if (rinfo.address !== PBX_IP || rinfo.port !== PBX_PORT) {
+          return;
+        }
+        if (!extensionSyncReady) {
+          if (!extensionAssembler) {
+            return;
+          }
+          const [index, offset] = EXTENSION_BLOCKS[extensionBlockIndex];
+          const expectedHeader = Buffer.from([
+            135,
+            4,
+            1,
+            index,
+            offset,
+            128
+          ]);
+          const isTableHeader = msg.subarray(0, 6).equals(expectedHeader);
+          const isOtherTableHeader = msg.length >= 6 && msg[0] === 135 && msg[1] === 4 && msg[2] === 1 && !isTableHeader;
+          const isCallEvent = (msg.length === 4 && msg[0] === 4 && (msg[1] === 16 || msg[1] === 17) || msg.length === 5 && msg[0] === 5 && msg[1] === 50) && msg.subarray(0, -1).reduce((xor, byte) => xor ^ byte, 0) === msg[msg.length - 1];
+          if (isOtherTableHeader || isCallEvent) {
+            return;
+          }
+          if (isTableHeader || extensionAssembler.isPending()) {
+            console.log(
+              `Block ${extensionBlockIndex + 1} fragment: ${msg.length} bytes`
+            );
+            const extensions = extensionAssembler.push(msg);
+            if (extensions !== null) {
+              clearTimeout(extensionSyncTimer);
+              extensionSyncTimer = null;
+              Object.assign(
+                extensionResults,
+                extensions
+              );
+              console.log(
+                `Block ${extensionBlockIndex + 1}/${EXTENSION_BLOCKS.length} completed.`
+              );
+              console.log(
+                `Records retrieved: ${Object.keys(extensionResults).length}`
+              );
+              extensionBlockIndex++;
+              requestNextExtensionBlock();
+            } else if (extensionAssembler.isPending()) {
+              console.log(
+                "Waiting for remaining fragments..."
+              );
+            } else {
+              console.warn(
+                "Extension response rejected: Invalid length or checksum."
+              );
+            }
+          }
+          return;
+        }
+      }
+      if (!PBX_FRAGMENTED_TABLE && msg.length >= 134 && msg[0] === 135 && msg[1] === 4 && msg[2] === 1 && msg[3] === 3 && msg[4] === 0 && msg[5] === 128) {
         console.log("Extension table received!");
         const tableData = msg.slice(6, 134);
         const extensions = decodeExtensionTable(tableData);
@@ -49641,6 +50067,9 @@ var require_listener = __commonJS({
       }
     }
     setInterval(() => {
+      if (!PBX_IP) {
+        return;
+      }
       const now = Date.now();
       const lastKnownResponse = lastPingSuccessAt ?? pingMonitorStartedAt;
       const elapsed = now - lastKnownResponse;
@@ -49655,8 +50084,62 @@ var require_listener = __commonJS({
         console.error("");
       }
     }, 1e3);
+    async function discoverAndConnect() {
+      if (radarSearching || PBX_IP) {
+        return;
+      }
+      radarSearching = true;
+      try {
+        console.log("");
+        console.log("===================================");
+        console.log("PBX RADAR SEARCHING");
+        console.log(
+          `Network: ${PBX_RADAR_PREFIX}.0/24`
+        );
+        console.log("===================================");
+        const discoveredIp = await radar.discover();
+        if (!discoveredIp) {
+          console.warn(
+            "[RADAR] No PBX found. Retrying in 5 seconds."
+          );
+          return;
+        }
+        PBX_IP = discoveredIp;
+        radarSearching = false;
+        console.log("");
+        console.log("===================================");
+        console.log("PBX RADAR - TARGET ACQUIRED");
+        console.log("===================================");
+        console.log(`PBX IP   : ${PBX_IP}`);
+        console.log(`PBX Port : ${PBX_PORT}`);
+        console.log("===================================");
+        resetRegistrationBuffer();
+        cancelExtensionSync();
+        lastPingSuccessAt = null;
+        pingMonitorStartedAt = Date.now();
+        pbxMarkedUnreachable = false;
+        startPbxPingMonitor();
+        sendPacket(
+          "06 05 50 42 58 49",
+          PBX_IP,
+          PBX_PORT
+        );
+      } catch (error) {
+        console.error(
+          "[RADAR] Discovery failed:",
+          error.message
+        );
+      } finally {
+        radarSearching = false;
+        if (!PBX_IP && !radarRetryTimer) {
+          radarRetryTimer = setTimeout(() => {
+            radarRetryTimer = null;
+            discoverAndConnect();
+          }, 5e3);
+        }
+      }
+    }
     socket.bind(0);
-    startPbxPingMonitor();
     module2.exports = socket;
   }
 });
