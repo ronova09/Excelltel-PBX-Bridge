@@ -6,11 +6,28 @@ const dgram = require('dgram');
 const { spawn } = require('child_process');
 
 // =====================================
+// PBX RADAR
+// =====================================
+
+const {
+    createPbxRadar,
+    validRegistration
+} = require('./pbxRadar');
+
+// =====================================
 // PBX CONNECTION CONFIGURATION
 // =====================================
 
-const PBX_IP = '192.168.110.114';
+// =====================================
+// DYNAMIC PBX CONFIGURATION
+// =====================================
+
+let PBX_IP = null;
+
 const PBX_PORT = 50001;
+
+const PBX_RADAR_PREFIX =
+    process.env.PBX_RADAR_PREFIX || '192.168.110';
 
 const PBX_PING_INTERVAL_MS = 1000;
 const PBX_TIMEOUT_MS = 2000;
@@ -38,6 +55,18 @@ const {
 } = require('../websocket/server');
 const callTracker = new CallTracker();
 const socket = dgram.createSocket('udp4');
+
+// =====================================
+// PBX RADAR INITIALIZATION
+// =====================================
+
+const radar = createPbxRadar(socket, {
+    prefix: PBX_RADAR_PREFIX,
+    port: PBX_PORT
+});
+
+let radarSearching = false;
+let radarRetryTimer = null;
 
 // =====================================
 // PBX EXTENSION TABLE ASSEMBLER
@@ -235,28 +264,51 @@ function formatDate(date) {
     });
 }
 
+// =====================================
+// PBX UDP LISTENER STARTUP
+// =====================================
 
 socket.on('listening', () => {
+
     const addr = socket.address();
 
     console.log('===================================');
     console.log('PBX UDP Client Started');
     console.log('===================================');
-    console.log(`Listening on ${addr.address}:${addr.port}`);
 
-    setTimeout(() => {
-    sendPacket(
-        '06 05 50 42 58 49',
-        PBX_IP,
-        PBX_PORT
+    console.log(
+        `Listening on ${addr.address}:${addr.port}`
     );
-}, 2000);
 
     console.log('');
+    console.log('Initializing PBX Radar...');
+    console.log('');
+
+    // Discover the PBX before registration.
+
+    setTimeout(
+        discoverAndConnect,
+        2000
+    );
+
 });
 
-
 socket.on('message', async (msg, rinfo) => {
+
+        // =====================================
+    // PBX RADAR PACKET PROTECTION
+    // =====================================
+
+    if (
+        radarSearching ||
+        !PBX_IP ||
+        rinfo.address !== PBX_IP ||
+        rinfo.port !== PBX_PORT
+    ) {
+
+        return;
+
+    }
 
     console.log('-----------------------------------');
     console.log(`Time   : ${new Date().toLocaleTimeString()}`);
@@ -399,11 +451,7 @@ if (
 // PBXI REGISTRATION RESPONSE
 // =========================================
 
-if (
-    msg.length === 13 &&
-    msg[0] === 0x0D &&
-    msg[1] === 0x05
-) {
+if (validRegistration(msg)) {
 
     console.log('PBX registration confirmed.');
 
@@ -1095,6 +1143,13 @@ function startPbxPingMonitor() {
 
 setInterval(() => {
 
+    // No PBX discovered yet.
+    // Do not report false connection timeouts.
+
+    if (!PBX_IP) {
+        return;
+    }
+
     const now = Date.now();
 
     const lastKnownResponse =
@@ -1121,6 +1176,122 @@ setInterval(() => {
 
 }, 1000);
 
+// =====================================
+// PBX RADAR - AUTOMATIC DISCOVERY
+// =====================================
+
+async function discoverAndConnect() {
+
+    // Prevent overlapping scans.
+    if (radarSearching || PBX_IP) {
+        return;
+    }
+
+    radarSearching = true;
+
+    try {
+
+        console.log('');
+        console.log('===================================');
+        console.log('PBX RADAR SEARCHING');
+        console.log(
+            `Network: ${PBX_RADAR_PREFIX}.0/24`
+        );
+        console.log('===================================');
+
+        const discoveredIp =
+            await radar.discover();
+
+        // =====================================
+        // NO PBX FOUND
+        // =====================================
+
+        if (!discoveredIp) {
+
+            console.warn(
+                '[RADAR] No PBX found. Retrying in 5 seconds.'
+            );
+
+            return;
+
+        }
+
+        // =====================================
+        // TARGET ACQUIRED
+        // =====================================
+
+        PBX_IP = discoveredIp;
+
+        radarSearching = false;
+
+        console.log('');
+        console.log('===================================');
+        console.log('PBX RADAR - TARGET ACQUIRED');
+        console.log('===================================');
+
+        console.log(`PBX IP   : ${PBX_IP}`);
+        console.log(`PBX Port : ${PBX_PORT}`);
+
+        console.log('===================================');
+
+        // =====================================
+        // RESET COMMUNICATION STATE
+        // =====================================
+
+        resetRegistrationBuffer();
+
+        cancelExtensionSync();
+
+        lastPingSuccessAt = null;
+
+        pingMonitorStartedAt = Date.now();
+
+        pbxMarkedUnreachable = false;
+
+        // =====================================
+        // START EXISTING HEALTH MONITOR
+        // =====================================
+
+        startPbxPingMonitor();
+
+        // =====================================
+        // REGISTER WITH DISCOVERED PBX
+        // =====================================
+
+        sendPacket(
+            '06 05 50 42 58 49',
+            PBX_IP,
+            PBX_PORT
+        );
+
+    } catch (error) {
+
+        console.error(
+            '[RADAR] Discovery failed:',
+            error.message
+        );
+
+    } finally {
+
+        radarSearching = false;
+
+        // Retry discovery if no PBX was found.
+
+        if (!PBX_IP && !radarRetryTimer) {
+
+            radarRetryTimer = setTimeout(() => {
+
+                radarRetryTimer = null;
+
+                discoverAndConnect();
+
+            }, 5000);
+
+        }
+
+    }
+
+}
 
 // =====================================
 // START UDP LISTENER AND HEALTH MONITOR
@@ -1128,6 +1299,6 @@ setInterval(() => {
 
 socket.bind(0);
 
-startPbxPingMonitor();
+//startPbxPingMonitor();
 
 module.exports = socket;
