@@ -9,7 +9,7 @@ const { spawn } = require('child_process');
 // PBX CONNECTION CONFIGURATION
 // =====================================
 
-const PBX_IP = '192.168.123.249';
+const PBX_IP = '192.168.110.114';
 const PBX_PORT = 50001;
 
 const PBX_PING_INTERVAL_MS = 1000;
