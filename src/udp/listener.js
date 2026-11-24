@@ -1,9 +1,11 @@
-
 // =====================================
 // PBX MULTIPLE OPERATOR SUPPORT
-// MAXIMUM 4 OPERATORS
+// CP832: Ports 1-4
+// D152 : Ports 121-124
+// Maximum: 4 Operators
 // =====================================
 
+// Read operator ports from .env
 const OPERATOR_PORTS = String(
     process.env.PBX_OPERATOR_PORTS ||
     process.env.PBX_OPERATOR_PORT ||
@@ -12,26 +14,48 @@ const OPERATOR_PORTS = String(
 .split(',')
 .map(port => Number(port.trim()));
 
-// Validate operator configuration
+
+// =====================================
+// VALIDATE OPERATOR CONFIGURATION
+// =====================================
+
+const isCP832 = OPERATOR_PORTS.every(
+    port =>
+        Number.isInteger(port) &&
+        port >= 1 &&
+        port <= 4
+);
+
+const isD152 = OPERATOR_PORTS.every(
+    port =>
+        Number.isInteger(port) &&
+        port >= 121 &&
+        port <= 124
+);
+
 if (
     OPERATOR_PORTS.length === 0 ||
     OPERATOR_PORTS.length > 4 ||
-    OPERATOR_PORTS.some(
-        port =>
-            !Number.isInteger(port) ||
-            port < 121 ||
-            port > 124
-    ) ||
-    new Set(OPERATOR_PORTS).size !== OPERATOR_PORTS.length
+    new Set(OPERATOR_PORTS).size !== OPERATOR_PORTS.length ||
+    (!isCP832 && !isD152)
 ) {
     throw new Error(
-        'Invalid PBX operator configuration. Maximum 4 operator ports (121-124).'
+        'Invalid PBX operator configuration. CP832: ports 1-4; D152: ports 121-124. Maximum 4 operators.'
     );
 }
 
-// Convert physical ports to PBX internal IDs
+
+// =====================================
+// CONVERT PHYSICAL PORTS TO INTERNAL IDs
+// =====================================
+
 const FRONT_DESK_IDS = new Set(
     OPERATOR_PORTS.map(port => port - 1)
+);
+
+console.log(
+    'PBX Operator Ports:',
+    OPERATOR_PORTS
 );
 
 console.log(

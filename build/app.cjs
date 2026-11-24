@@ -49517,7 +49517,23 @@ var require_extensionTable = __commonJS({
 // src/udp/listener.js
 var require_listener = __commonJS({
   "src/udp/listener.js"(exports2, module2) {
-    var FRONT_DESK_ID = Number(process.env.PBX_OPERATOR_PORT || 1) - 1;
+    var OPERATOR_PORTS = String(
+      process.env.PBX_OPERATOR_PORTS || process.env.PBX_OPERATOR_PORT || "121"
+    ).split(",").map((port) => Number(port.trim()));
+    if (OPERATOR_PORTS.length === 0 || OPERATOR_PORTS.length > 4 || OPERATOR_PORTS.some(
+      (port) => !Number.isInteger(port) || port < 121 || port > 124
+    ) || new Set(OPERATOR_PORTS).size !== OPERATOR_PORTS.length) {
+      throw new Error(
+        "Invalid PBX operator configuration. Maximum 4 operator ports (121-124)."
+      );
+    }
+    var FRONT_DESK_IDS = new Set(
+      OPERATOR_PORTS.map((port) => port - 1)
+    );
+    console.log(
+      "PBX Operator IDs:",
+      [...FRONT_DESK_IDS]
+    );
     var dgram = require("dgram");
     var { spawn } = require("child_process");
     var {
@@ -49839,8 +49855,12 @@ var require_listener = __commonJS({
       console.log(decoded);
       const callState = callTracker.processEvent(decoded);
       if (callState) {
-        const isIncomingToOperator = callState.destinationId === FRONT_DESK_ID;
-        const isOutgoingFromOperator = callState.callerId === FRONT_DESK_ID;
+        const isIncomingToOperator = FRONT_DESK_IDS.has(
+          Number(callState.destinationId)
+        );
+        const isOutgoingFromOperator = FRONT_DESK_IDS.has(
+          Number(callState.callerId)
+        );
         console.log("PBX CALL DEBUG:", {
           state: callState.state,
           caller: callState.caller,
