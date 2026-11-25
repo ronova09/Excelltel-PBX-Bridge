@@ -49333,55 +49333,78 @@ var require_callTracker = __commonJS({
   "src/udp/callTracker.js"(exports2, module2) {
     var CallTracker = class {
       constructor() {
-        this.activeCall = null;
+        this.activeCalls = /* @__PURE__ */ new Map();
       }
+      // =====================================
+      // PROCESS PBX EVENT
+      // =====================================
       processEvent(event) {
         if (!event || !event.type) {
           return null;
         }
         if (event.type === "dial") {
-          this.activeCall = {
+          const callerId = Number(event.callerId);
+          const destinationId = Number(event.destinationId);
+          if (event.callerId == null || event.destinationId == null || !Number.isInteger(callerId) || !Number.isInteger(destinationId)) {
+            return null;
+          }
+          const callKey2 = `${callerId}:${destinationId}`;
+          const call = {
             caller: event.caller,
-            callerId: event.callerId,
+            callerId,
             destination: event.destination,
-            destinationId: event.destinationId,
+            destinationId,
             callCode: event.callCode,
             state: "ringing",
             startedAt: /* @__PURE__ */ new Date()
           };
-          return this.activeCall;
+          this.activeCalls.set(callKey2, call);
+          return call;
         }
-        if (event.type === "off_hook" && this.activeCall) {
-          if (event.extensionId === this.activeCall.destinationId) {
-            this.activeCall.state = "answered";
-            this.activeCall.answeredAt = /* @__PURE__ */ new Date();
-          }
-          return this.activeCall;
+        if (event.type !== "off_hook" && event.type !== "on_hook") {
+          return null;
         }
-        if (event.type === "on_hook" && this.activeCall) {
-          const isCaller = event.extensionId === this.activeCall.callerId;
-          const isDestination = event.extensionId === this.activeCall.destinationId;
-          if (!isCaller && !isDestination) {
-            return this.activeCall;
-          }
-          if (this.activeCall.state === "ringing") {
-            this.activeCall.state = "unanswered";
-            this.activeCall.endedBy = event.extension;
-            this.activeCall.endedAt = /* @__PURE__ */ new Date();
-            const completedCall = this.activeCall;
-            this.activeCall = null;
-            return completedCall;
-          }
-          if (this.activeCall.state === "answered") {
-            this.activeCall.state = "ended";
-            this.activeCall.endedBy = event.extension;
-            this.activeCall.endedAt = /* @__PURE__ */ new Date();
-            const completedCall = this.activeCall;
-            this.activeCall = null;
-            return completedCall;
-          }
+        const extensionId = Number(event.extensionId);
+        if (event.extensionId == null || !Number.isInteger(extensionId)) {
+          return null;
         }
-        return this.activeCall;
+        const matches = [
+          ...this.activeCalls.entries()
+        ].filter(([, call]) => {
+          if (event.type === "off_hook") {
+            return call.destinationId === extensionId && call.state === "ringing";
+          }
+          return call.callerId === extensionId || call.destinationId === extensionId;
+        });
+        if (matches.length !== 1) {
+          if (matches.length > 1) {
+            console.warn(
+              `PBX CallTracker: Ambiguous ${event.type} for extension ID ${extensionId}.`
+            );
+          }
+          return null;
+        }
+        const [callKey, activeCall] = matches[0];
+        if (event.type === "off_hook") {
+          activeCall.state = "answered";
+          activeCall.answeredAt = /* @__PURE__ */ new Date();
+          return activeCall;
+        }
+        if (event.type === "on_hook") {
+          if (activeCall.state !== "ringing" && activeCall.state !== "answered") {
+            return null;
+          }
+          if (activeCall.state === "ringing") {
+            activeCall.state = "unanswered";
+          } else {
+            activeCall.state = "ended";
+          }
+          activeCall.endedBy = event.extension;
+          activeCall.endedAt = /* @__PURE__ */ new Date();
+          this.activeCalls.delete(callKey);
+          return activeCall;
+        }
+        return null;
       }
     };
     module2.exports = CallTracker;
@@ -49520,15 +49543,23 @@ var require_listener = __commonJS({
     var OPERATOR_PORTS = String(
       process.env.PBX_OPERATOR_PORTS || process.env.PBX_OPERATOR_PORT || "121"
     ).split(",").map((port) => Number(port.trim()));
-    if (OPERATOR_PORTS.length === 0 || OPERATOR_PORTS.length > 4 || OPERATOR_PORTS.some(
-      (port) => !Number.isInteger(port) || port < 121 || port > 124
-    ) || new Set(OPERATOR_PORTS).size !== OPERATOR_PORTS.length) {
+    var isCP832 = OPERATOR_PORTS.every(
+      (port) => Number.isInteger(port) && port >= 1 && port <= 4
+    );
+    var isD152 = OPERATOR_PORTS.every(
+      (port) => Number.isInteger(port) && port >= 121 && port <= 124
+    );
+    if (OPERATOR_PORTS.length === 0 || OPERATOR_PORTS.length > 4 || new Set(OPERATOR_PORTS).size !== OPERATOR_PORTS.length || !isCP832 && !isD152) {
       throw new Error(
-        "Invalid PBX operator configuration. Maximum 4 operator ports (121-124)."
+        "Invalid PBX operator configuration. CP832: ports 1-4; D152: ports 121-124. Maximum 4 operators."
       );
     }
     var FRONT_DESK_IDS = new Set(
       OPERATOR_PORTS.map((port) => port - 1)
+    );
+    console.log(
+      "PBX Operator Ports:",
+      OPERATOR_PORTS
     );
     console.log(
       "PBX Operator IDs:",

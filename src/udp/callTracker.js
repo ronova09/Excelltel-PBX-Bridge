@@ -1,79 +1,203 @@
+// =====================================
+// EXCELLTEL PBX BRIDGE
+// MULTIPLE SIMULTANEOUS CALL TRACKER
+// CP832 / D152 COMPATIBLE
+// =====================================
+
 class CallTracker {
+
     constructor() {
-        this.activeCall = null;
+
+        // Store multiple active conversations
+        // instead of a single activeCall.
+
+        this.activeCalls = new Map();
+
     }
 
+
+    // =====================================
+    // PROCESS PBX EVENT
+    // =====================================
+
     processEvent(event) {
+
         if (!event || !event.type) {
             return null;
         }
 
-        // A new call/dial event
-        if (event.type === "dial") {
-            this.activeCall = {
-                caller: event.caller,
-                callerId: event.callerId,
-                destination: event.destination,
-                destinationId: event.destinationId,
-                callCode: event.callCode,
-                state: "ringing",
-                startedAt: new Date()
-            };
 
-            return this.activeCall;
-        }
+        // =====================================
+        // NEW CALL / DIAL EVENT
+        // =====================================
 
-        // Called extension goes off-hook.
-        // For now, this means the call was answered.
-        if (event.type === "off_hook" && this.activeCall) {
-            if (event.extensionId === this.activeCall.destinationId) {
-                this.activeCall.state = "answered";
-                this.activeCall.answeredAt = new Date();
+        if (event.type === 'dial') {
+
+            const callerId = Number(event.callerId);
+            const destinationId = Number(event.destinationId);
+
+            if (
+                event.callerId == null ||
+                event.destinationId == null ||
+                !Number.isInteger(callerId) ||
+                !Number.isInteger(destinationId)
+            ) {
+                return null;
             }
 
-            return this.activeCall;
+            // Unique key for each caller/destination pair.
+
+            const callKey =
+                `${callerId}:${destinationId}`;
+
+            const call = {
+
+                caller: event.caller,
+                callerId,
+
+                destination: event.destination,
+                destinationId,
+
+                callCode: event.callCode,
+
+                state: 'ringing',
+
+                startedAt: new Date()
+
+            };
+
+            // Save the call independently.
+
+            this.activeCalls.set(callKey, call);
+
+            return call;
         }
 
-        // Extension goes on-hook.
-        if (event.type === 'on_hook' && this.activeCall) {
-    const isCaller =
-        event.extensionId === this.activeCall.callerId;
 
-    const isDestination =
-        event.extensionId === this.activeCall.destinationId;
+        // =====================================
+        // HOOK EVENT VALIDATION
+        // =====================================
 
-    if (!isCaller && !isDestination) {
-        return this.activeCall;
-    }
+        if (
+            event.type !== 'off_hook' &&
+            event.type !== 'on_hook'
+        ) {
+            return null;
+        }
 
-    // Call was never answered
-    if (this.activeCall.state === 'ringing') {
-        this.activeCall.state = 'unanswered';
-        this.activeCall.endedBy = event.extension;
-        this.activeCall.endedAt = new Date();
+        const extensionId =
+            Number(event.extensionId);
 
-        const completedCall = this.activeCall;
+        if (
+            event.extensionId == null ||
+            !Number.isInteger(extensionId)
+        ) {
+            return null;
+        }
 
-        this.activeCall = null;
 
-        return completedCall;
-    }
+        // =====================================
+        // FIND THE CORRECT ACTIVE CALL
+        // =====================================
 
-    // Answered call has ended
-    if (this.activeCall.state === 'answered') {
-        this.activeCall.state = 'ended';
-        this.activeCall.endedBy = event.extension;
-        this.activeCall.endedAt = new Date();
+        const matches = [
+            ...this.activeCalls.entries()
+        ].filter(([, call]) => {
 
-        const completedCall = this.activeCall;
+            if (event.type === 'off_hook') {
 
-        this.activeCall = null;
+                // The destination answers the call.
 
-        return completedCall;
-    }
-}
+                return (
+                    call.destinationId === extensionId &&
+                    call.state === 'ringing'
+                );
+            }
 
-        return this.activeCall;
+            // Either participant may end the call.
+
+            return (
+                call.callerId === extensionId ||
+                call.destinationId === extensionId
+            );
+
+        });
+
+
+        // No matching call, or the event cannot
+        // be attributed to exactly one conversation.
+
+        if (matches.length !== 1) {
+
+            if (matches.length > 1) {
+
+                console.warn(
+                    `PBX CallTracker: Ambiguous ${event.type} ` +
+                    `for extension ID ${extensionId}.`
+                );
+
+            }
+
+            return null;
+        }
+
+
+        const [callKey, activeCall] = matches[0];
+
+
+        // =====================================
+        // CALL ANSWERED
+        // =====================================
+
+        if (event.type === 'off_hook') {
+
+            activeCall.state = 'answered';
+
+            activeCall.answeredAt = new Date();
+
+            return activeCall;
+        }
+
+
+        // =====================================
+        // CALL ENDED / UNANSWERED
+        // =====================================
+
+        if (event.type === 'on_hook') {
+
+            if (
+                activeCall.state !== 'ringing' &&
+                activeCall.state !== 'answered'
+            ) {
+                return null;
+            }
+
+            if (activeCall.state === 'ringing') {
+
+                // Call ended before being answered.
+
+                activeCall.state = 'unanswered';
+
+            } else {
+
+                // Previously answered call ended.
+
+                activeCall.state = 'ended';
+            }
+
+            activeCall.endedBy = event.extension;
+
+            activeCall.endedAt = new Date();
+
+            // Remove only this completed call.
+            // Other conversations remain active.
+
+            this.activeCalls.delete(callKey);
+
+            return activeCall;
+        }
+
+        return null;
     }
 }
 
